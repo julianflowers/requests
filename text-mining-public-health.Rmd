@@ -1,0 +1,267 @@
+---
+title: "Analysing text in public health practice using R"
+output: 
+    github_document:
+      toc: yes
+
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, cache = TRUE, message = FALSE, warning = FALSE)
+```
+
+#  Motivation
+
+It is said that > 90% of the world's data is *unstructured* - that is data not following a fixed schema or format. Text is said to be unstructured data and there is growing recognition that analysing text can generate new insight and new hypotheses, and automate repetitive tasks.
+
+R has a powerful suite of text analytical tools. 
+
+In this note we demonstrate some applications of text mining to support the core public health activities of reading and writing.
+
+
+## Some basics - turning text into data
+
+First some basic terminology:
+
+token
+: a basic unit of textual data, for example characters, words, ngrams, sentences
+
+stop words
+: common words e.g. *the, and, it* which are generally removed from texts prior to analysis
+
+ngram
+: one or more successive words. One word is a *unigram*, two consecutive words a *bigram* and so on.
+
+corpus
+: a data format for storing documents or texts
+
+document-term-matrix
+: a matrix in which the rows are documents are texts or documents, the columns are tokens and the cell values are counts
+
+stemming
+: stemming is the process of reducing inflected (or sometimes derived) words to their word stem, base or root form
+
+lemma
+: Lemmatisation (or lemmatization) in linguistics is the process of grouping together the inflected forms of a word so they can be analysed as a single item, identified by the word's lemma, or dictionary form.
+
+### R packages
+
+There are a number of really useful R packages for text analysis. The ones I use (and have used in this note) are:
+
+* `tm`         full text mining
+* `tidytext`   tidy text mining
+* `quanteda`   powerful and quick
+* `sentimentr` sophisticated sentiment
+* `readtext`   powerful text reader
+* `udpipe`     nlp 
+
+
+I have also developed some useful (I think) functions which I house in the `myScrapers` package.
+
+```{r, results = "hide"}
+
+library(pacman)
+
+p_load(tm, tidytext, quanteda, sentimentr, readtext, udpipe, tidyverse, textrank,  wordcloud)
+
+remotes::install_github("julianflowers/myScrapers", force = TRUE)
+
+library(myScrapers)
+
+
+```
+
+### Getting text                                                                                                                                                                                                                                                                                                                
+We'll need some text to work with. For this we will scrape the text of Duncan Selbie's friday messages from PHE blogs via ^[they are now only available via html embedded emails].
+
+```{r extract-blog-text}
+
+## create a list of weblinks
+url <- "https://publichealthmatters.blog.gov.uk"
+url1 <- paste0(url, "/page/", 2:93)
+urls <- c(url, url1)
+
+
+## extract page links from blog pages
+links <- map(urls, get_page_links)
+
+## filter to extract links for Friday blogs
+
+link_text <- links %>%
+  enframe() %>%
+  unnest() %>%
+  mutate(friday_message = str_detect(value, "duncan-selbies-friday-message")) %>%
+  filter(friday_message == TRUE, 
+         !str_detect(value, "#comment")) %>%
+  distinct() %>%
+  mutate(date = str_extract_all(value, "\\d{4}/\\d{2}/\\d{2}")) %>%
+  unnest(date) %>%
+  mutate(text = map(value, get_page_text))
+
+## extract page text
+
+texts <- link_text %>%
+  group_by(date) %>%
+  mutate(text = paste(text, collapse = " ")) %>%
+  select(date, text)
+
+
+head(texts)
+
+```
+
+
+
+
+### Tokenisation
+
+```{r tokenise}
+
+tokens <- texts %>%
+  unnest_tokens(word, text, "words") %>%
+  anti_join(stop_words) %>%
+  mutate(word = tm::removeNumbers(word), 
+         word = tm::removePunctuation(word)) 
+
+head(tokens, 30)
+
+```
+
+## Visualising the blogs
+
+### Wordclouds
+
+It is a straightforward task to create a simple visualisation of the blogs with a wordcloud
+
+```{r}
+
+palette = viridis::viridis(10)
+
+tokens_count <- tokens %>%
+  ungroup() %>%
+  count(word) %>%
+  filter(nchar(word) > 0) 
+
+
+with(tokens_count, wordcloud(word, n, max.words = 100, colors = palette))
+
+
+
+```
+
+We can see some words which feature in every blog - for example  - *cookies, blog, duncan, publichealthmattersbloggovuk, week" which tend to dominate the wordcloud. We'll remove some of the these frequent terms...
+
+```{r}
+
+tokens_count1 <- tokens %>%
+  ungroup() %>%
+  count(word) %>%
+  filter(nchar(word) > 0, 
+         !word %in% c("cookies", "blog", "duncan", "licence", "phe", "govuk", "government", "publichealthmattersbloggovuk", "week", "blogs", "health", 
+                      "public", "published", "friday", "https", "message", "nhs")
+         ) 
+
+with(tokens_count1, wordcloud(word, n, max.words = 100, colors = palette))
+
+
+
+
+```
+
+We can see words like local, prevention, mental, cancer, disease, evidence, expert and insight are frequently mentioned.
+
+
+### Bigram clouds
+
+Sometimes bigram (2-word) wordclouds are more informative.
+
+
+```{r cars}
+
+bigram_count <- texts %>%
+  mutate(text = tm::removeNumbers(text)) %>%
+  ungroup() %>%
+  create_bigrams(., "text") %>%
+  count(bigram, sort = TRUE) %>%
+  top_n(100, n) %>%
+  filter(n< 100, 
+         !bigram %in% c("friday messages", "wishes duncan", "wishes friday"))
+set.seed(123)
+with(bigram_count, wordcloud(bigram, n, max.words = 100, colors = palette, rot.per  =.5, random.order = FALSE))
+
+
+```
+
+We can now see that "mental health" and "local authorities" feature heavily.
+
+## Creating a corpus
+
+Converting texts to a corpus format is required for some text mining operations. This is easily done with the `quanteda` package. Docvars are metadata fields which can be added to the corpus.
+
+```{r}
+
+corpus <- corpus(texts, text_field = "text")
+
+corpus[1]
+
+```
+
+## Creating a document feature matrix (dfm)
+
+The main analytical format for text mining is a document-term or document-feature matrix (dfm). This is easy to create in `quanteda`.  dfms are *sparse* matrices - that is most of the cells are 0. They can be very large so can have high computing overhead. We can remove numbers, stopwords, urls etc. and create ngrams.
+
+```{r dfm}
+
+dfm <- dfm(corpus, remove = stopwords("en"), remove_numbers = TRUE, remove_punct =  TRUE, remove_url = TRUE, ngrams = 1:3)
+
+dfm
+
+```
+
+
+## Dictionary searching
+
+We can search within dfms using specified terms. These can be setup as a dictionary. The `create_lookup` function in `myScrapers` facilitates this.
+
+```{r}
+
+terms <- create_lookup(prevention = c("prevent*", "avoid*"), 
+                       smoking = c("smok*", "tobacco"), 
+                       inequality = c("ineq*"))
+
+terms
+```
+
+
+```{r fig.height= 6, fig.width= 4}
+
+result <- dfm_lookup(dfm, dictionary = terms)
+
+tidy(result) %>%
+  #spread(term, count, fill = 0) %>%
+  ggplot(aes(term, document, fill = count)) +
+  geom_tile() +
+  viridis::scale_fill_viridis() 
+  
+
+  
+```
+
+## Keywords in context (kwic)
+
+kwic allows us to find the surrounding words for any given terms. For example if we want to find the context for "inequality" we can apply the kwic function.
+
+```{r}
+
+ineq <- kwic(corpus, "inequal*", window = 10)
+
+ineq <- data.frame(ineq) 
+
+ineq %>%
+  head()
+
+
+
+```
+
+There are 47 mentions of the word "inequality" in 35 blogs. 
